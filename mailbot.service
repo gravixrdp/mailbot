@@ -1,0 +1,19 @@
+[Unit]
+Description=Mailbot - Telegram Job Application Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/mailbot
+ExecStart=/home/ubuntu/mailbot/venv/bin/python3 /home/ubuntu/mailbot/main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+Environment="PYTHONUNBUFFERED=1"
+Environment="AUTO_SYNC_SHEET=1"
+
+[Install]
+WantedBy=multi-user.target
