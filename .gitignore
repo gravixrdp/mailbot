@@ -4,3 +4,5 @@ bounce_state.json
 venv/
 __pycache__/
 *.pyc
+gen-lang-client-*.json
+gen-lang-client-*.json

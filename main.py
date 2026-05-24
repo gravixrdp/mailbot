@@ -26,8 +26,6 @@ import re
 import smtplib
 import logging
 import asyncio
-import urllib.request
-import urllib.error
 import ssl
 import imaplib
 import email as email_pkg
@@ -51,13 +49,16 @@ from telegram.ext import (
 # ─────────────────────────────────────────────
 #  CONFIG  –  fill these before running
 # ─────────────────────────────────────────────
-BOT_TOKEN   = "8734256867:AAEzI6niegh0W6GEmzFmvoJTw98BjMyXJCI"          # paste your bot token
+BOT_TOKEN   = "8413258612:AAF1VHcO3Wrk7BjjXw0sAClJY4o8Ci0shZA"          # paste your bot token
 GMAIL_USER  = "vishalgurjar0444@gmail.com"
 GMAIL_PASS  = os.getenv("GMAIL_APP_PASS", "")  # set via /setpass or env var
 RESUME_PATH = "vishal_devops_resume.pdf"                   # path to your resume
 SENT_LOG    = "sent_log.json"               # auto-created, tracks sent mails
-SHEET_CONFIG = "sheet_config.json"          # stores Google Sheet webhook (Apps Script Web App)
+SHEET_CONFIG = "sheet_config.json"          # stores Google Sheet config
 BOUNCE_STATE = "bounce_state.json"          # stores last processed IMAP UID for bounce checks
+# ─── GCP Sheet Sync (direct via Service Account) ───
+SHEET_ID       = os.getenv("SHEET_ID", "1a16BeOSUqfDNHQwzfI55QfUDTCcJZqjIseqnAy5DKGY")
+CREDENTIALS_PATH = os.getenv("GCP_CREDENTIALS", "gen-lang-client-0428625036-fcdde7565288.json")
 # ─────────────────────────────────────────────
 
 logging.basicConfig(
@@ -165,177 +166,141 @@ def mark_sent(domain: str, email: str):
     return sent_at
 
 # ═══════════════════════════════════════════════════════
-#  GOOGLE SHEET SYNC (via Apps Script Web App webhook)
+#  GOOGLE SHEET SYNC (direct via GCP Service Account)
 # ═══════════════════════════════════════════════════════
 
-def _load_sheet_config() -> dict:
-    if os.path.exists(SHEET_CONFIG):
-        try:
-            with open(SHEET_CONFIG, "r") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
-    return {}
+def _get_sheet():
+    """Authorize and return the gspread sheet object."""
+    import gspread
+    from google.oauth2.service_account import Credentials
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+    creds = Credentials.from_service_account_file(CREDENTIALS_PATH, scopes=scope)
+    client = gspread.authorize(creds)
+    sh = client.open_by_key(SHEET_ID)
+    return sh.sheet1
 
-def _save_sheet_config(cfg: dict):
-    with open(SHEET_CONFIG, "w") as f:
-        json.dump(cfg, f, indent=2)
 
-def get_sheet_webhook_url() -> str:
-    cfg = _load_sheet_config()
-    return (cfg.get("webhook_url") or os.getenv("SHEET_WEBHOOK_URL") or "").strip()
+def _read_all_rows(sheet):
+    """Read all rows and return (values, domain_map, header_start)."""
+    values = sheet.get_values()
+    if not values:
+        return values, {}, 1
+    header_val = str(values[0][0] or "").strip().lower()
+    start = 2 if header_val == "domain" else 1
+    domain_map = {}
+    for i, row in enumerate(values[start - 1:], start=start):
+        d = str(row[0] or "").strip().lower()
+        if d:
+            domain_map[d] = i
+    return values, domain_map, start
 
-def set_sheet_webhook_url(url: str):
-    cfg = _load_sheet_config()
-    cfg["webhook_url"] = url.strip()
-    _save_sheet_config(cfg)
-
-def _sheet_secret() -> str:
-    cfg = _load_sheet_config()
-    return (cfg.get("secret") or os.getenv("SHEET_WEBHOOK_SECRET") or "").strip()
-
-def set_sheet_secret(secret: str):
-    cfg = _load_sheet_config()
-    cfg["secret"] = secret.strip()
-    _save_sheet_config(cfg)
-
-def _post_json(url: str, payload: dict, timeout_s: int = 20) -> tuple[bool, str]:
-    body = json.dumps(payload).encode("utf-8")
-
-    class _NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, headers, newurl):
-            return None
-
-    try:
-        opener = urllib.request.build_opener(_NoRedirect)
-        req = urllib.request.Request(
-            url,
-            data=body,
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            method="POST",
-        )
-        try:
-            resp = opener.open(req, timeout=timeout_s)
-        except urllib.error.HTTPError as e:
-            # urllib raises HTTPError for 3xx/4xx/5xx when redirects are disabled
-            resp = e
-
-        status = getattr(resp, "code", None) or getattr(resp, "status", None) or 0
-        raw = ""
-        try:
-            raw = resp.read().decode("utf-8", errors="replace").strip()
-        except Exception:
-            raw = ""
-
-        # Apps Script Web Apps commonly respond 302 with a Location that contains the real JSON output.
-        if int(status) in (301, 302, 303, 307, 308):
-            location = resp.headers.get("Location") if hasattr(resp, "headers") else None
-            if not location:
-                return False, raw or f"http_{status}"
-            try:
-                with urllib.request.urlopen(location, timeout=timeout_s) as out:
-                    raw = out.read().decode("utf-8", errors="replace").strip()
-            except Exception as e:
-                return False, str(e)
-            status = 200
-
-        if not (200 <= int(status) < 300):
-            return False, raw or f"http_{status}"
-
-        # Validate ok/error if present.
-        try:
-            data = json.loads(raw) if raw else {}
-            if isinstance(data, dict) and data.get("ok") is False:
-                return False, str(data.get("error") or raw or "error")
-            if isinstance(data, dict) and data.get("ok") is True:
-                return True, raw or "ok"
-        except Exception:
-            pass
-
-        return True, raw or "ok"
-    except urllib.error.HTTPError as e:
-        try:
-            raw = e.read().decode("utf-8", errors="replace").strip()
-        except Exception:
-            raw = ""
-        return False, raw or f"http_{e.code}"
-    except Exception as e:
-        return False, str(e)
 
 def sync_sheet_upsert(domain: str, email: str, sent_at: str) -> tuple[bool, str]:
-    """Upserts single domain row into Google Sheet (does not touch local sent_log)."""
-    url = get_sheet_webhook_url()
-    if not url:
-        return False, "sheet webhook not configured"
-
-    payload = {
-        "action": "upsert",
-        "secret": _sheet_secret() or None,
-        # Sheet columns (as per your sheet): Domain, Company, Email, Sent At, Status
-        "rows": [[domain.lower(), domain_to_company(domain), email, sent_at, "yes"]],
-    }
-    ok, msg = _post_json(url, payload)
-    return ok, msg
-
-def sync_sheet_set_status(domain: str, status: str) -> tuple[bool, str]:
-    url = get_sheet_webhook_url()
-    if not url:
-        return False, "sheet webhook not configured"
-
-    payload = {
-        "action": "set_status",
-        "secret": _sheet_secret() or None,
-        "rows": [[domain.lower(), status]],
-    }
-    ok, msg = _post_json(url, payload)
-    return ok, msg
-
-def sync_sheet_all() -> tuple[bool, str, int]:
-    """Syncs entire sent_log.json to the sheet."""
-    url = get_sheet_webhook_url()
-    if not url:
-        return False, "sheet webhook not configured", 0
-
-    log = load_sent_log()
-    rows = []
-    for domain, info in log.items():
-        rows.append([
-            domain.lower(),
-            domain_to_company(domain),
-            info.get("email", ""),
-            info.get("sent_at", ""),
-            "yes",
-        ])
-
-    payload = {
-        "action": "upsert",
-        "secret": _sheet_secret() or None,
-        "rows": rows,
-    }
-    ok, msg = _post_json(url, payload, timeout_s=60)
-    return ok, msg, len(rows)
-
-def sheet_webhook_status() -> tuple[bool, str]:
-    """Returns raw JSON string from webhook GET for quick debugging/version check."""
-    url = get_sheet_webhook_url()
-    if not url:
-        return False, "sheet webhook not configured"
+    """Upserts single domain row into Google Sheet (batch write)."""
     try:
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            raw = resp.read().decode("utf-8", errors="replace").strip()
-        try:
-            data = json.loads(raw) if raw else {}
-            if isinstance(data, dict):
-                # show minimal, useful info
-                version = data.get("version") or "unknown"
-                sheet_name = data.get("sheet") or data.get("target_sheet") or "unknown"
-                return True, f"version={version}, sheet={sheet_name}"
-        except Exception:
-            pass
-        return True, raw[:400] if raw else "ok"
+        sheet = _get_sheet()
+        values, dmap, _ = _read_all_rows(sheet)
+        d = domain.lower()
+        company = domain_to_company(domain)
+        new_row = [d, company, email, sent_at, "yes"]
+
+        if d in dmap:
+            r = dmap[d]
+            sheet.update(values=[[email, sent_at, "yes"]], range_name=f"C{r}:E{r}")
+        else:
+            sheet.append_row(new_row)
+        return True, "ok"
     except Exception as e:
         return False, str(e)
+
+
+def sync_sheet_set_status(domain: str, status: str) -> tuple[bool, str]:
+    """Update status (col E) for a given domain row."""
+    try:
+        sheet = _get_sheet()
+        _, dmap, _ = _read_all_rows(sheet)
+        d = domain.lower()
+        if d not in dmap:
+            return False, "domain not found"
+        r = dmap[d]
+        sheet.update(values=[[status]], range_name=f"E{r}:E{r}")
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+
+def sync_sheet_all() -> tuple[bool, str, int]:
+    """Sync entire sent_log.json to sheet using batch writes."""
+    try:
+        sheet = _get_sheet()
+        values, dmap, _ = _read_all_rows(sheet)
+        log = load_sent_log()
+        count = 0
+        updates = []
+        new_rows = []
+
+        for domain, info in log.items():
+            d = domain.lower()
+            company = domain_to_company(domain)
+            email = info.get("email", "")
+            sent_at = info.get("sent_at", "")
+            if d in dmap:
+                r = dmap[d]
+                updates.append((r, [email, sent_at, "yes"]))
+            else:
+                new_rows.append([d, company, email, sent_at, "yes"])
+            count += 1
+
+        # Batch update all existing rows in ONE API call
+        if updates:
+            value_ranges = []
+            for r, data in updates:
+                value_ranges.append({
+                    "range": f"Sheet1!C{r}:E{r}",
+                    "values": [data],
+                })
+            sheet.batch_update({
+                "valueRanges": value_ranges,
+                "includeValuesInResponse": False,
+            })
+        if new_rows:
+            sheet.append_rows(new_rows)
+        return True, "ok", count
+    except Exception as e:
+        return False, str(e), 0
+
+
+def sheet_webhook_status() -> tuple[bool, str]:
+    """Return sheet info for debugging."""
+    try:
+        sheet = _get_sheet()
+        values, _, _ = _read_all_rows(sheet)
+        total = len(values) - 1 if values else 0
+        return True, f"sheet={sheet.title}, sheetId={SHEET_ID}, total_rows={total}"
+    except Exception as e:
+        return False, str(e)
+
+
+def get_sheet_webhook_url() -> str:
+    """Return non-empty if sheet is configured (backward compat shim)."""
+    return SHEET_ID if os.path.exists(CREDENTIALS_PATH) else ""
+
+
+def set_sheet_webhook_url(url: str):
+    """No-op kept for backward compatibility."""
+    pass
+
+
+def _sheet_secret() -> str:
+    return ""
+
+
+def set_sheet_secret(secret: str):
+    pass
+
 
 def _should_auto_sync_sheet() -> bool:
     val = os.getenv("AUTO_SYNC_SHEET", "").strip().lower()
@@ -663,9 +628,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "👋 *Vishal's Smart Job Mailer Bot*\n\n"
         "📌 *Commands:*\n"
         "• `/setpass <app_password>` – Set Gmail App Password\n"
-        "• `/setsheet <webhook_url>` – Set Google Sheet webhook\n"
-        "• `/setsecret <secret>` – Optional webhook secret\n"
-        "• `/sheetstatus` – Check webhook version\n"
+        "• `/setsheet [SHEET_ID]` – Configure Google Sheet\n"
+        "• `/sheetstatus` – Check sheet status\n"
         "• `/syncsheet` – Push full sent log to sheet\n"
         "• `/bulk <emails...>` – Send in bulk (10s gap)\n"
         "• `/cancelbulk` – Stop bulk sending\n"
@@ -679,7 +643,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "✔ Replaces company name in mail body\n"
         "✔ Blocks duplicate mails to same company\n"
         "✔ Attaches your resume automatically\n"
-        "✔ Sends bold-formatted HTML email"
+        "✔ Sends bold-formatted HTML email\n"
+        "✔ Syncs directly to Google Sheet via GCP"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -700,39 +665,52 @@ async def cmd_setpass(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_setsheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Configure sheet or set a custom Sheet ID.
+    Usage: /setsheet (shows current) or /setsheet <SHEET_ID>
+    Also accepts webhook URL for backward compatibility."""
     args = ctx.args
     if not args:
+        ok, msg = await asyncio.to_thread(sheet_webhook_status)
+        if ok:
+            await update.message.reply_text(
+                f"ℹ️ Sheet config:\n`{msg}`",
+                parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ Sheet config: `{msg}`\n\n"
+                "Use: `/setsheet <SHEET_ID>` to set a custom Google Sheet ID.",
+                parse_mode="Markdown",
+            )
+        return
+    value = " ".join(args).strip()
+    # If it looks like a webhook URL, store it for backward compat
+    if value.startswith("https://"):
+        set_sheet_webhook_url(value)
         await update.message.reply_text(
-            "❌ Usage: `/setsheet https://script.google.com/macros/s/.../exec`\n\n"
-            "After setting it, run `/syncsheet`.",
+            "✅ Sheet webhook saved (backward compat mode).",
             parse_mode="Markdown",
         )
         return
-    url = " ".join(args).strip()
-    if not url.startswith("https://"):
-        await update.message.reply_text("❌ Please send a valid `https://...` URL.", parse_mode="Markdown")
-        return
-    set_sheet_webhook_url(url)
-    await update.message.reply_text("✅ Sheet webhook saved. Now run `/syncsheet`.", parse_mode="Markdown")
+    # Otherwise treat as a Sheet ID
+    set_sheet_webhook_url(value)
+    await update.message.reply_text(
+        f"✅ Sheet ID saved. Now run `/syncsheet`.",
+        parse_mode="Markdown",
+    )
 
 async def cmd_setsecret(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    args = ctx.args
-    if not args:
-        await update.message.reply_text(
-            "❌ Usage: `/setsecret your_random_secret`\n\n"
-            "Set the same secret inside Apps Script Script Properties as `SECRET`.",
-            parse_mode="Markdown",
-        )
-        return
-    secret = " ".join(args).strip()
-    set_sheet_secret(secret)
-    await update.message.reply_text("✅ Secret saved.", parse_mode="Markdown")
+    await update.message.reply_text(
+        "ℹ️ Secret is no longer needed — the bot uses GCP Service Account credentials directly.",
+        parse_mode="Markdown",
+    )
 
 async def cmd_syncsheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    url = get_sheet_webhook_url()
-    if not url:
+    if not get_sheet_webhook_url():
         await update.message.reply_text(
-            "⚠️ Sheet webhook not set.\nUse: `/setsheet <webhook_url>`",
+            "⚠️ Sheet not configured.\n"
+            "Place GCP credentials as `gen-lang-client-0428625036-fcdde7565288.json` in this folder.\n"
+            "Or set SHEET_ID env var.",
             parse_mode="Markdown",
         )
         return
@@ -751,16 +729,9 @@ async def cmd_syncsheet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_sheetstatus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ok, msg = await asyncio.to_thread(sheet_webhook_status)
     if ok:
-        await update.message.reply_text(f"ℹ️ Sheet webhook: `{msg}`", parse_mode="Markdown")
-        if "version=2026-04-03-v4" not in msg:
-            await update.message.reply_text(
-                "⚠️ Your Apps Script deployment looks OLD.\n"
-                "Apps Script → Deploy → *Manage deployments* → Edit → *New version* → Deploy.\n"
-                "Then run `/syncsheet` again.",
-                parse_mode="Markdown",
-            )
+        await update.message.reply_text(f"ℹ️ Sheet status: `{msg}`", parse_mode="Markdown")
     else:
-        await update.message.reply_text(f"❌ Webhook status failed: `{msg}`", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ Sheet status failed: `{msg}`", parse_mode="Markdown")
 
 async def cmd_bulk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Bulk sender – takes many emails and sends them one-by-one with 10s gap."""
@@ -858,7 +829,7 @@ async def cmd_bulk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown",
                 )
 
-                if _should_auto_sync_sheet() and get_sheet_webhook_url():
+                if os.path.exists(CREDENTIALS_PATH):
                     ok, msg = await asyncio.to_thread(sync_sheet_upsert, domain, to_email, sent_at)
                     if not ok:
                         logger.warning("Sheet sync failed for %s: %s", domain, msg)
@@ -901,7 +872,7 @@ async def cmd_cancelbulk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_checkbounces(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not get_sheet_webhook_url():
         await update.message.reply_text(
-            "⚠️ Sheet webhook not set.\nUse: `/setsheet <webhook_url>`",
+            "⚠️ Sheet not configured.\nPlace GCP credentials file in this folder or set SHEET_ID env var.",
             parse_mode="Markdown",
         )
         return
@@ -998,7 +969,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-    if sent_at and _should_auto_sync_sheet() and get_sheet_webhook_url():
+    if sent_at and os.path.exists(CREDENTIALS_PATH):
         def _sync_one():
             return sync_sheet_upsert(domain, to_email, sent_at)
         ok, msg = await asyncio.to_thread(_sync_one)
@@ -1034,7 +1005,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📧 Sent to: `{to_email}`",
             parse_mode="Markdown"
         )
-        if sent_at and _should_auto_sync_sheet() and get_sheet_webhook_url():
+        if sent_at and os.path.exists(CREDENTIALS_PATH):
             def _sync_one():
                 return sync_sheet_upsert(domain, to_email, sent_at)
             ok, msg = await asyncio.to_thread(_sync_one)
