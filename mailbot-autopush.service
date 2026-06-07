@@ -1,0 +1,15 @@
+[Unit]
+Description=Mailbot Auto-Push - commit & push folder changes to GitHub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/mailbot
+ExecStart=/home/ubuntu/mailbot/auto_push.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
