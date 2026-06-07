@@ -11,7 +11,7 @@ from datetime import datetime
 CREDENTIALS_PATH = "gen-lang-client-0428625036-fcdde7565288.json"
 SENT_LOG = "sent_log.json"
 
-SHEET_ID = "1-AUFpWgfJyuQLI3NxdE6mPtgl93-N87st4Emk0aGieY"
+SHEET_ID = "1a16BeOSUqfDNHQwzfI55QfUDTCcJZqjIseqnAy5DKGY"
 
 
 def main():

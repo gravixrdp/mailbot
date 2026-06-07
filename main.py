@@ -259,13 +259,10 @@ def sync_sheet_all() -> tuple[bool, str, int]:
             value_ranges = []
             for r, data in updates:
                 value_ranges.append({
-                    "range": f"Sheet1!C{r}:E{r}",
+                    "range": f"C{r}:E{r}",
                     "values": [data],
                 })
-            sheet.batch_update({
-                "valueRanges": value_ranges,
-                "includeValuesInResponse": False,
-            })
+            sheet.batch_update(value_ranges)
         if new_rows:
             sheet.append_rows(new_rows)
         return True, "ok", count
